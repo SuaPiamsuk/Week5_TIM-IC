@@ -32,6 +32,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define CAPTURENUM 16 //ขนาดเท้่าไหร้หก็ได้
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -40,21 +41,41 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim11;
+DMA_HandleTypeDef hdma_tim1_ch1;
 
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+//for microsecond measurement
+uint64_t _micros = 0; //นับเวลาปัจจุบัน เมื่อครบ 65535 ก็จะ+65535 ทุกการ interrupt (ทำเพราะtime1,11 จะวนกลับไปที่0ใหม่)
 
+
+
+//12 P/R , Gear reduction 1 : 64
+//DMA Buffer
+uint16_t capturedata[CAPTURENUM]={0}; //uint16_t because Halfword in DMA setting
+
+
+//diff time of capture data
+int32_t DiffTime[CAPTURENUM-1]={0};
+//Mean difftime
+float MeanTime = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_TIM11_Init(void);
+static void MX_TIM1_Init(void);
 /* USER CODE BEGIN PFP */
+uint64_t micros();
 
+//read speed of encoder
+void encoderSpeedReaderCycle();
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -90,10 +111,18 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_TIM11_Init();
+  MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
+  HAL_TIM_Base_Start_IT(&htim11); //FOR START TIM11
+  uint64_t timestamp =0;
 
+
+  //start Input capture in DMA
+  HAL_TIM_Base_Start(&htim1);
+  HAL_TIM_IC_Start_DMA(&htim1,TIM_CHANNEL_1,(uint32_t*) capturedata, CAPTURENUM);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -103,6 +132,11 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	if(micros()-timestamp > 1000000)
+	{
+		timestamp = micros();
+		HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+	}
   }
   /* USER CODE END 3 */
 }
@@ -149,6 +183,65 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_IC_InitTypeDef sConfigIC = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 99;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 65535;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_IC_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 2;
+  if (HAL_TIM_IC_ConfigChannel(&htim1, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+
 }
 
 /**
@@ -216,6 +309,22 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream1_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -249,7 +358,25 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+//Time counter
+uint64_t micros()
+{
+	return _micros + htim11.Instance->CNT; //pull time from CNT(counter) ปัจจุบัน
+}
+//Interrupt ใช้คำว่า Callbackตลอแด
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+	if(htim == &htim11) //check ว่าคือ TIM11
+	{
+		_micros += 65535;
+	}
+}
 
+
+//void encoderSpeedReaderCycle()
+//{
+//
+//}
 /* USER CODE END 4 */
 
 /**
